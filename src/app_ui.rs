@@ -13,7 +13,8 @@ use crate::engine_run::{self, RunKind, RunMessage};
 use crate::exit_code::{Outcome, Severity, outcome_of};
 use crate::journal_files::{DayJournals, find_journals};
 use crate::lifecycle::{DayRecord, lock_owner, read_state};
-use crate::settings::{Layers, PluginEntry, SettingsForm, discover_plugins, resolve};
+use crate::screenshot_daemon::Daemon;
+use crate::settings::{Layers, PluginEntry, SettingsForm, discover_plugins, resolve, screenshot_settings};
 use crate::tray::TrayState;
 
 const REFRESH_EVERY: Duration = Duration::from_secs(15);
@@ -62,6 +63,8 @@ pub struct App {
     selected_day: Option<String>,
     show_checkpoint: bool,
     journal_text: String,
+    screenshots: bool,
+    daemon: Result<Option<Daemon>, String>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -88,11 +91,42 @@ impl App {
             selected_day: None,
             show_checkpoint: false,
             journal_text: String::new(),
+            screenshots: desktop_config::screenshots_enabled(),
+            daemon: Ok(None),
             wake,
         };
         app.refresh();
         app.load_form();
+        app.restart_daemon();
         app
+    }
+
+    /// Stop any running screenshot loop and start a new one from the engine's current settings.
+    fn restart_daemon(&mut self) {
+        self.daemon = Ok(None); // drops (stops) the old loop first
+        if !self.screenshots {
+            return;
+        }
+        let Some(root) = self.engine_root.clone() else { return };
+        self.daemon = (|| {
+            let settings = Layers::load(&root, "settings")?;
+            let data_dir = resolve(
+                &root,
+                &settings
+                    .get_str(&["paths", "data_dir"])
+                    .unwrap_or_else(|| "./data".into()),
+            );
+            // As the engine's `_timezone_name`: the settings model defaults to UTC, and a blank or
+            // unknown name falls back to Asia/Jakarta.
+            let zone = settings.get_str(&["day", "timezone"]).unwrap_or_else(|| "UTC".into());
+            let timezone = zone.trim().parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::Asia::Jakarta);
+            Ok::<_, String>(Some(Daemon::start(
+                screenshot_settings(&settings),
+                data_dir,
+                timezone,
+                self.wake.clone(),
+            )))
+        })();
     }
 
     /// Re-read everything the engine owns.
@@ -322,6 +356,11 @@ impl App {
                 ),
             };
         }
+        match &self.daemon {
+            Ok(Some(daemon)) => ui.label(format!("Screenshots: {}", daemon.last())),
+            Ok(None) => ui.label(RichText::new("Screenshots: off").weak()),
+            Err(e) => ui.colored_label(severity_colour(Severity::Blocked), format!("Screenshots: {e}")),
+        };
         ui.add_space(8.0);
         ui.label(RichText::new("Days in state.json").strong());
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -428,6 +467,7 @@ impl App {
                         self.engine_root = Some(path);
                         self.refresh();
                         self.load_form();
+                        self.restart_daemon();
                         self.save_message = Some(match saved {
                             Ok(()) => (true, "Engine folder saved.".to_owned()),
                             Err(e) => (false, e),
@@ -449,6 +489,21 @@ impl App {
                 self.save_message = Some((false, format!("Autostart: {e}")));
             }
             ui.label("Scheduled runs stay in Task Scheduler, so they happen even when this app is closed.");
+            if ui
+                .checkbox(
+                    &mut self.screenshots,
+                    "Take screenshots while this app runs ([screenshot] settings)",
+                )
+                .changed()
+            {
+                if let Err(e) = desktop_config::set_screenshots(self.screenshots) {
+                    self.save_message = Some((false, format!("Screenshots: {e}")));
+                }
+                self.restart_daemon();
+            }
+            ui.label(
+                "This replaces the ActivityJournal-Daemon scheduled task; disable that task so both do not capture.",
+            );
             ui.separator();
 
             let Some(root) = self.engine_root.clone() else { return };
@@ -522,6 +577,7 @@ impl App {
         })();
         self.refresh();
         self.load_form();
+        self.restart_daemon();
         match result {
             Ok(()) => (true, "Saved. The next run uses these settings.".to_owned()),
             Err(e) => (false, e),

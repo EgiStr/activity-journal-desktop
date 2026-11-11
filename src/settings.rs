@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table};
 
+use crate::screenshot_rules::ScreenshotSettings;
+
 /// One configuration file pair: the tracked example and the git-ignored local override.
 pub struct Layers {
     example: DocumentMut,
@@ -44,6 +46,17 @@ impl Layers {
 
     pub fn get_bool(&self, path: &[&str]) -> Option<bool> {
         self.get(path).and_then(Item::as_bool)
+    }
+
+    pub fn get_u64(&self, path: &[&str]) -> Option<u64> {
+        self.get(path)
+            .and_then(Item::as_integer)
+            .and_then(|v| u64::try_from(v).ok())
+    }
+
+    pub fn get_str_list(&self, path: &[&str]) -> Option<Vec<String>> {
+        let array = self.get(path).and_then(Item::as_array)?;
+        Some(array.iter().filter_map(|v| v.as_str()).map(str::to_owned).collect())
     }
 
     /// Write `value` at `path` into the local layer, creating tables as needed.
@@ -211,6 +224,25 @@ impl SettingsForm {
     }
 }
 
+/// `[screenshot]`, with the engine's defaults for anything not set.
+pub fn screenshot_settings(layers: &Layers) -> ScreenshotSettings {
+    let defaults = ScreenshotSettings::default();
+    ScreenshotSettings {
+        interval_seconds: layers
+            .get_u64(&["screenshot", "interval_seconds"])
+            .unwrap_or(defaults.interval_seconds),
+        excluded_processes: layers
+            .get_str_list(&["screenshot", "excluded_processes"])
+            .unwrap_or_default(),
+        excluded_title_keywords: layers
+            .get_str_list(&["screenshot", "excluded_title_keywords"])
+            .unwrap_or_default(),
+        minimum_free_megabytes: layers
+            .get_u64(&["screenshot", "minimum_free_megabytes"])
+            .unwrap_or(defaults.minimum_free_megabytes),
+    }
+}
+
 /// A plugin found on disk through its manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginEntry {
@@ -298,6 +330,19 @@ mod tests {
         assert_eq!(Layers::from_text(example, "").staged_plugins(), ["a", "b"]);
         let local = "[[stages]]\nkind = \"collector\"\nplugins = [\"c\"]\n";
         assert_eq!(Layers::from_text(example, local).staged_plugins(), ["c"]);
+    }
+
+    #[test]
+    fn screenshot_settings_fall_back_to_the_engine_defaults() {
+        assert_eq!(
+            screenshot_settings(&Layers::from_text(EXAMPLE, "")),
+            ScreenshotSettings::default()
+        );
+        let local = "[screenshot]\ninterval_seconds = 60\nexcluded_processes = [\"KeePass.exe\"]\n";
+        let read = screenshot_settings(&Layers::from_text(EXAMPLE, local));
+        assert_eq!(read.interval_seconds, 60);
+        assert_eq!(read.excluded_processes, ["KeePass.exe"]);
+        assert_eq!(read.minimum_free_megabytes, 2048);
     }
 
     #[test]

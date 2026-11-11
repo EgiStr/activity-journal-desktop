@@ -1,4 +1,5 @@
-//! The app's own settings: where the engine lives, and whether to start at logon. Stored per user
+//! The app's own settings: where the engine lives, whether to start at logon, and whether to take
+//! screenshots. Stored per user
 //! under `%APPDATA%\activity-journal-desktop\desktop.toml`, never next to the binary.
 
 use std::path::PathBuf;
@@ -23,9 +24,7 @@ pub fn engine_root(args: &[String]) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(ENGINE_ENV) {
         return Some(PathBuf::from(path));
     }
-    let text = std::fs::read_to_string(config_path()?).ok()?;
-    let document: DocumentMut = text.parse().ok()?;
-    document.get("engine_root").and_then(|i| i.as_str()).map(PathBuf::from)
+    load().get("engine_root").and_then(|i| i.as_str()).map(PathBuf::from)
 }
 
 /// Whether `path` looks like an Activity Journal checkout.
@@ -34,12 +33,29 @@ pub fn is_engine_root(path: &std::path::Path) -> bool {
 }
 
 pub fn save_engine_root(path: &std::path::Path) -> Result<(), String> {
-    let file = config_path().ok_or("APPDATA is not set")?;
-    let mut document: DocumentMut = std::fs::read_to_string(&file)
-        .ok()
+    save_key("engine_root", toml_edit::value(path.display().to_string()))
+}
+
+/// Whether the app runs the screenshot loop. Off unless the owner turned it on.
+pub fn screenshots_enabled() -> bool {
+    load().get("screenshots").and_then(|i| i.as_bool()).unwrap_or(false)
+}
+
+pub fn set_screenshots(enabled: bool) -> Result<(), String> {
+    save_key("screenshots", toml_edit::value(enabled))
+}
+
+fn load() -> DocumentMut {
+    config_path()
+        .and_then(|file| std::fs::read_to_string(file).ok())
         .and_then(|t| t.parse().ok())
-        .unwrap_or_default();
-    document["engine_root"] = toml_edit::value(path.display().to_string());
+        .unwrap_or_default()
+}
+
+fn save_key(key: &str, value: toml_edit::Item) -> Result<(), String> {
+    let file = config_path().ok_or("APPDATA is not set")?;
+    let mut document = load();
+    document[key] = value;
     std::fs::create_dir_all(file.parent().expect("the config file has a folder")).map_err(|e| e.to_string())?;
     std::fs::write(&file, document.to_string()).map_err(|e| format!("cannot write {}: {e}", file.display()))
 }

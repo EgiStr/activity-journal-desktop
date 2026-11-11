@@ -17,6 +17,15 @@ tray-icon = "0.26"
 toml_edit = "0.25"
 serde_json = "1"
 chrono-tz = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+png = "0.18"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = "thin"

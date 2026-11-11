@@ -16,6 +16,7 @@ Native Rust GUI: `egui` driven directly on `winit` + `wgpu` (no `eframe`, no web
 | Run | Checkpoint, final run and dry run. Output streams into the Run tab. The exit code is reported with its real meaning: `0` ok, `10` partial, `20` stuck, `30` privacy blocked, `40` day already closed, `75` lock held. |
 | Journal | The published `journal/YYYY/MM/*.md` files, read-only, final or checkpoint. |
 | Settings | Paths, timezone, model, router URL, router and privacy toggles, and enable/disable for every plugin found under `plugins/*/plugin.json`. Validated before saving. Only changed values are written, into `config/settings.local.toml` and `config/pipeline.local.toml`, keeping your comments. Secrets stay in the environment. |
+| Screenshots | Optional, off by default. The engine's screenshot daemon, ported: every `[screenshot] interval_seconds` it stops below `minimum_free_megabytes`, skips without grabbing when the foreground process or title is excluded, and otherwise writes a PNG of all screens to `<data_dir>/screenshots/<day>/<HHMMSS>.png`, where the engine's purge removes it. Replaces the `ActivityJournal-Daemon` scheduled task; disable that task when you turn this on. |
 | Autostart | Optional per-user logon entry that starts the app in the tray. The engine's scheduled runs stay in Task Scheduler, so they still happen when the app is closed. |
 
 What it deliberately does not do: change the engine, its output, its lifecycle or its privacy

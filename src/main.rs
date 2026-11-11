@@ -9,6 +9,9 @@ mod engine_run;
 mod exit_code;
 mod journal_files;
 mod lifecycle;
+mod screen_capture;
+mod screenshot_daemon;
+mod screenshot_rules;
 mod settings;
 mod tray;
 
