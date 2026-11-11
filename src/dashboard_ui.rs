@@ -115,6 +115,12 @@ impl Dashboard {
             ui.label("Choose the Activity Journal folder in Settings.");
             return None;
         };
+        if !engine_run::speaks_json(root) {
+            ui.label(
+                "This engine has no `journal history` or `journal timeline` yet. Update it to a                  version with the `--json` commands to see the dashboard.",
+            );
+            return None;
+        }
         if self.history.is_none() && self.history_pending.is_none() {
             self.load_history(root, today, wake);
         }

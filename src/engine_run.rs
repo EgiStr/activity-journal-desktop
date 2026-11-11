@@ -18,13 +18,23 @@ pub enum RunKind {
     DryRun,
 }
 
+/// Whether the engine at `engine_root` has the `--json` commands (Phase 1). An older engine
+/// rejects `--json` as an unknown option, so it is run the old way instead.
+pub fn speaks_json(engine_root: &Path) -> bool {
+    engine_root.join("src/activity_journal/cli/run_document.py").is_file()
+}
+
 impl RunKind {
-    pub fn arguments(self) -> &'static [&'static str] {
-        match self {
-            RunKind::Final => &["run", "journal", "run", "--json"],
-            RunKind::Checkpoint => &["run", "journal", "run", "--checkpoint", "--json"],
-            RunKind::DryRun => &["run", "journal", "run", "--dry-run", "--json"],
+    pub fn arguments(self, json: bool) -> Vec<&'static str> {
+        let mut arguments = match self {
+            RunKind::Final => vec!["run", "journal", "run"],
+            RunKind::Checkpoint => vec!["run", "journal", "run", "--checkpoint"],
+            RunKind::DryRun => vec!["run", "journal", "run", "--dry-run"],
+        };
+        if json {
+            arguments.push("--json");
         }
+        arguments
     }
 
     pub fn label(self) -> &'static str {
@@ -96,7 +106,8 @@ pub fn start(
     messages: Sender<RunMessage>,
     wake: impl Fn() + Send + Sync + Clone + 'static,
 ) {
-    let mut child = match command(engine_root, kind.arguments()).spawn() {
+    let arguments = kind.arguments(speaks_json(engine_root));
+    let mut child = match command(engine_root, &arguments).spawn() {
         Ok(child) => child,
         Err(e) => {
             let _ = messages.send(RunMessage::Line(format!("Could not start `uv`: {e}")));
@@ -152,14 +163,20 @@ mod tests {
 
     #[test]
     fn arguments_match_the_engine_cli() {
-        assert_eq!(RunKind::Final.arguments().join(" "), "run journal run --json");
+        assert_eq!(RunKind::Final.arguments(true).join(" "), "run journal run --json");
         assert_eq!(
-            RunKind::Checkpoint.arguments().join(" "),
+            RunKind::Checkpoint.arguments(true).join(" "),
             "run journal run --checkpoint --json"
         );
         assert_eq!(
-            RunKind::DryRun.arguments().join(" "),
+            RunKind::DryRun.arguments(true).join(" "),
             "run journal run --dry-run --json"
         );
+    }
+
+    #[test]
+    fn an_older_engine_is_run_without_json() {
+        assert_eq!(RunKind::Final.arguments(false).join(" "), "run journal run");
+        assert!(!speaks_json(Path::new("no such engine folder")));
     }
 }

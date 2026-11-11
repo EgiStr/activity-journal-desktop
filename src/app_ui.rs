@@ -234,8 +234,14 @@ impl App {
                 None => "— the engine did not report an exit code".to_owned(),
             });
             // The run's own document names the cause and the degraded sources. An engine older
-            // than `run --json` prints none, and then state.json's stuck cause is the best left.
-            let report = parse_run(&stdout);
+            // than `run --json` is run without it and prints none; state.json's stuck cause is
+            // then the best left.
+            let speaks_json = self.engine_root.as_deref().is_some_and(engine_run::speaks_json);
+            let report = if speaks_json {
+                parse_run(&stdout)
+            } else {
+                Err("this engine predates `run --json`; update it for causes and degraded sources".to_owned())
+            };
             match &report {
                 Ok(r) if code.is_some_and(|c| i64::from(c) != r.exit_code) => self.log.push(format!(
                     "— the engine's document says exit {}, the process exited {}",
@@ -284,8 +290,11 @@ impl App {
             return;
         };
         let (sender, receiver): (Sender<RunMessage>, _) = channel();
-        self.log
-            .push(format!("— {} started: uv {}", kind.label(), kind.arguments().join(" ")));
+        self.log.push(format!(
+            "— {} started: uv {}",
+            kind.label(),
+            kind.arguments(engine_run::speaks_json(&root)).join(" ")
+        ));
         let wake = self.wake.clone();
         engine_run::start(&root, kind, sender, move || wake());
         self.run = Some(RunState {
