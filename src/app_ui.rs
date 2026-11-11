@@ -13,6 +13,7 @@ use crate::engine_run::{self, RunKind, RunMessage};
 use crate::exit_code::{Outcome, Severity, outcome_of};
 use crate::journal_files::{DayJournals, find_journals};
 use crate::lifecycle::{DayRecord, lock_owner, read_state};
+use crate::notice;
 use crate::screenshot_daemon::Daemon;
 use crate::settings::{Layers, PluginEntry, SettingsForm, discover_plugins, resolve, screenshot_settings};
 use crate::tray::TrayState;
@@ -225,8 +226,15 @@ impl App {
             self.last_run = Some((kind, outcome));
             self.run = None;
             self.refresh();
+            let cause = self.view.days.iter().find_map(|d| d.stuck_cause.as_deref());
+            notice::show(notice::run_finished(kind, outcome, cause));
         } else if self.refreshed.elapsed() >= REFRESH_EVERY {
             self.refresh();
+        }
+        if let Ok(Some(daemon)) = &self.daemon
+            && let Some(reason) = daemon.take_stopped()
+        {
+            notice::show(notice::screenshots_stopped(&reason));
         }
         Some(self.refreshed + REFRESH_EVERY)
     }

@@ -16,6 +16,7 @@ use crate::screenshot_rules::{Decision, ScreenshotSettings, decide};
 pub struct Daemon {
     stop: Arc<AtomicBool>,
     last: Arc<Mutex<String>>,
+    stopped: Arc<Mutex<Option<String>>>,
 }
 
 impl Daemon {
@@ -27,16 +28,19 @@ impl Daemon {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let last = Arc::new(Mutex::new("starting".to_owned()));
-        let (thread_stop, thread_last) = (stop.clone(), last.clone());
+        let stopped = Arc::new(Mutex::new(None));
+        let (thread_stop, thread_last, thread_stopped) = (stop.clone(), last.clone(), stopped.clone());
         std::thread::spawn(move || {
             let interval = Duration::from_secs(settings.interval_seconds.max(1));
             while !thread_stop.load(Ordering::Relaxed) {
                 let (line, stopped) = iterate(&settings, &data_dir, timezone);
-                *thread_last.lock().unwrap_or_else(|e| e.into_inner()) = line;
-                wake();
+                *thread_last.lock().unwrap_or_else(|e| e.into_inner()) = line.clone();
                 if stopped {
+                    *thread_stopped.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
+                    wake();
                     return;
                 }
+                wake();
                 let mut slept = Duration::ZERO;
                 while slept < interval && !thread_stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(500));
@@ -44,7 +48,12 @@ impl Daemon {
                 }
             }
         });
-        Self { stop, last }
+        Self { stop, last, stopped }
+    }
+
+    /// Why the loop stopped itself, returned once so the app notifies once.
+    pub fn take_stopped(&self) -> Option<String> {
+        self.stopped.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// The last iteration, in the engine daemon's one-line format.
