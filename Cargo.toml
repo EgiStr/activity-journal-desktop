@@ -8,7 +8,7 @@ description = "Tray, status and settings for Activity Journal, over its engine a
 publish = false
 
 [dependencies]
-egui = "0.37"
+egui = { version = "0.37", features = ["default_fonts"] }
 egui-winit = "0.37"
 egui-wgpu = { version = "0.37", features = ["winit"] }
 winit = "0.30.13"
