@@ -6,8 +6,14 @@ use crate::exit_code::{Outcome, Severity};
 
 const APP_NAME: &str = "Activity Journal";
 
-/// The title and body for a finished run. `stuck_cause` is the cause `state.json` records, if any.
-pub fn run_finished(kind: RunKind, outcome: Option<Outcome>, stuck_cause: Option<&str>) -> (String, String) {
+/// The title and body for a finished run. `cause` is the run's own failure (from `run --json`, or
+/// `state.json` for an older engine); `degraded` names the sources a partial run lost.
+pub fn run_finished(
+    kind: RunKind,
+    outcome: Option<Outcome>,
+    cause: Option<&str>,
+    degraded: &[String],
+) -> (String, String) {
     let Some(o) = outcome else {
         return (
             format!("{}: could not start", kind.label()),
@@ -19,8 +25,11 @@ pub fn run_finished(kind: RunKind, outcome: Option<Outcome>, stuck_cause: Option
         Severity::Caveat => format!("{}: {} (exit {})", kind.label(), o.label, o.code),
         Severity::Blocked => format!("{} blocked: {} (exit {})", kind.label(), o.label, o.code),
     };
-    let body = match stuck_cause {
+    let body = match cause {
         Some(cause) if o.severity == Severity::Blocked => format!("{} Cause: {cause}", o.advice),
+        _ if o.severity == Severity::Caveat && !degraded.is_empty() => {
+            format!("{} Degraded: {}.", o.advice, degraded.join(", "))
+        }
         _ => o.advice.to_owned(),
     };
     (title, body)
@@ -50,7 +59,7 @@ mod tests {
 
     #[test]
     fn a_block_names_its_code_and_the_recorded_cause() {
-        let (title, body) = run_finished(RunKind::Final, Some(outcome_of(20)), Some("remote is ahead"));
+        let (title, body) = run_finished(RunKind::Final, Some(outcome_of(20)), Some("remote is ahead"), &[]);
         assert_eq!(title, "Final run blocked: stuck (exit 20)");
         assert!(body.ends_with("Cause: remote is ahead"), "{body}");
     }
@@ -58,28 +67,33 @@ mod tests {
     #[test]
     fn privacy_and_lock_are_never_a_generic_failure() {
         assert_eq!(
-            run_finished(RunKind::Checkpoint, Some(outcome_of(30)), None).0,
+            run_finished(RunKind::Checkpoint, Some(outcome_of(30)), None, &[]).0,
             "Checkpoint blocked: privacy blocked (exit 30)"
         );
         assert_eq!(
-            run_finished(RunKind::Checkpoint, Some(outcome_of(75)), None).0,
+            run_finished(RunKind::Checkpoint, Some(outcome_of(75)), None, &[]).0,
             "Checkpoint blocked: lock held (exit 75)"
         );
     }
 
     #[test]
     fn partial_is_success_with_a_caveat_and_ignores_stale_causes() {
-        let (title, body) = run_finished(RunKind::Final, Some(outcome_of(10)), Some("old cause"));
+        let degraded = vec!["chrome".to_owned(), "git".to_owned()];
+        let (title, body) = run_finished(RunKind::Final, Some(outcome_of(10)), Some("old cause"), &degraded);
         assert_eq!(title, "Final run: partial (exit 10)");
         assert!(!body.contains("old cause"));
+        assert!(body.ends_with("Degraded: chrome, git."), "{body}");
         assert_eq!(
-            run_finished(RunKind::DryRun, Some(outcome_of(0)), None).0,
+            run_finished(RunKind::DryRun, Some(outcome_of(0)), None, &[]).0,
             "Dry run: done"
         );
     }
 
     #[test]
     fn a_run_that_never_started_says_so() {
-        assert_eq!(run_finished(RunKind::Final, None, None).0, "Final run: could not start");
+        assert_eq!(
+            run_finished(RunKind::Final, None, None, &[]).0,
+            "Final run: could not start"
+        );
     }
 }

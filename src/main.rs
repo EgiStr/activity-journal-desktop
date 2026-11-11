@@ -4,7 +4,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_ui;
+mod dashboard_data;
+mod dashboard_ui;
 mod desktop_config;
+mod engine_json;
 mod engine_run;
 mod exit_code;
 mod journal_files;

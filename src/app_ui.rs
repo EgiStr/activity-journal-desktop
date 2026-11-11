@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
+use crate::dashboard_ui::{Action, Dashboard};
 use crate::desktop_config;
+use crate::engine_json::parse_run;
 use crate::engine_run::{self, RunKind, RunMessage};
 use crate::exit_code::{Outcome, Severity, outcome_of};
 use crate::journal_files::{DayJournals, find_journals};
@@ -24,6 +26,7 @@ const LOG_LIMIT: usize = 5_000;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Status,
+    Dashboard,
     Journal,
     Run,
     Settings,
@@ -37,6 +40,8 @@ struct EngineView {
     plugins: Vec<PluginEntry>,
     staged: Vec<String>,
     lock_pid: Option<u32>,
+    /// The engine's current day id, in its configured timezone.
+    today: Option<String>,
     errors: Vec<String>,
 }
 
@@ -66,6 +71,7 @@ pub struct App {
     journal_text: String,
     screenshots: bool,
     daemon: Result<Option<Daemon>, String>,
+    dashboard: Dashboard,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -94,6 +100,7 @@ impl App {
             journal_text: String::new(),
             screenshots: desktop_config::screenshots_enabled(),
             daemon: Ok(None),
+            dashboard: Dashboard::default(),
             wake,
         };
         app.refresh();
@@ -117,14 +124,10 @@ impl App {
                     .get_str(&["paths", "data_dir"])
                     .unwrap_or_else(|| "./data".into()),
             );
-            // As the engine's `_timezone_name`: the settings model defaults to UTC, and a blank or
-            // unknown name falls back to Asia/Jakarta.
-            let zone = settings.get_str(&["day", "timezone"]).unwrap_or_else(|| "UTC".into());
-            let timezone = zone.trim().parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::Asia::Jakarta);
             Ok::<_, String>(Some(Daemon::start(
                 screenshot_settings(&settings),
                 data_dir,
-                timezone,
+                engine_timezone(&settings),
                 self.wake.clone(),
             )))
         })();
@@ -160,6 +163,12 @@ impl App {
                     Err(e) => view.errors.push(e),
                 }
                 view.lock_pid = lock_owner(&data_dir);
+                view.today = Some(
+                    chrono::Utc::now()
+                        .with_timezone(&engine_timezone(&settings))
+                        .format("%Y-%m-%d")
+                        .to_string(),
+                );
                 view.journals = find_journals(&journal_dir);
                 if view.journals.is_empty() {
                     view.errors
@@ -213,21 +222,41 @@ impl App {
                             self.log.drain(..self.log.len() - LOG_LIMIT);
                         }
                     }
-                    RunMessage::Finished(code) => finished = Some((run.kind, code)),
+                    RunMessage::Finished { code, stdout } => finished = Some((run.kind, code, stdout)),
                 }
             }
         }
-        if let Some((kind, code)) = finished {
+        self.dashboard.poll();
+        if let Some((kind, code, stdout)) = finished {
             let outcome = code.map(outcome_of);
             self.log.push(match outcome {
                 Some(o) => format!("— exit {} ({}): {}", o.code, o.label, o.advice),
                 None => "— the engine did not report an exit code".to_owned(),
             });
+            // The run's own document names the cause and the degraded sources. An engine older
+            // than `run --json` prints none, and then state.json's stuck cause is the best left.
+            let report = parse_run(&stdout);
+            match &report {
+                Ok(r) if code.is_some_and(|c| i64::from(c) != r.exit_code) => self.log.push(format!(
+                    "— the engine's document says exit {}, the process exited {}",
+                    r.exit_code,
+                    code.unwrap_or_default()
+                )),
+                Ok(r) if !r.degraded.is_empty() => {
+                    self.log.push(format!("— degraded: {}", r.degraded.join(", ")));
+                }
+                Ok(_) => {}
+                Err(e) => self.log.push(format!("— {e}")),
+            }
             self.last_run = Some((kind, outcome));
             self.run = None;
             self.refresh();
-            let cause = self.view.days.iter().find_map(|d| d.stuck_cause.as_deref());
-            notice::show(notice::run_finished(kind, outcome, cause));
+            self.dashboard.history_changed();
+            let (cause, degraded) = match report {
+                Ok(r) => (r.cause, r.degraded),
+                Err(_) => (self.view.days.iter().find_map(|d| d.stuck_cause.clone()), Vec::new()),
+            };
+            notice::show(notice::run_finished(kind, outcome, cause.as_deref(), &degraded));
         } else if self.refreshed.elapsed() >= REFRESH_EVERY {
             self.refresh();
         }
@@ -239,8 +268,10 @@ impl App {
         Some(self.refreshed + REFRESH_EVERY)
     }
 
+    /// Whether something is in flight that animates (a run, or a dashboard query), so the window
+    /// keeps repainting its spinner.
     pub fn is_running(&self) -> bool {
-        self.run.is_some()
+        self.run.is_some() || self.dashboard.is_loading()
     }
 
     /// Start a run unless one is already going. The engine's own lock still decides across processes.
@@ -302,6 +333,7 @@ impl App {
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
                 ui.selectable_value(&mut self.tab, Tab::Journal, "Journal");
                 ui.selectable_value(&mut self.tab, Tab::Run, "Run");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
@@ -323,6 +355,7 @@ impl App {
         });
         egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
             Tab::Status => self.status_ui(ui),
+            Tab::Dashboard => self.dashboard_ui(ui),
             Tab::Journal => self.journal_ui(ui),
             Tab::Run => self.run_ui(ui),
             Tab::Settings => self.settings_ui(ui),
@@ -402,6 +435,21 @@ impl App {
         });
     }
 
+    fn dashboard_ui(&mut self, ui: &mut egui::Ui) {
+        let root = self.engine_root.clone();
+        let action = self.dashboard.ui(
+            ui,
+            root.as_deref(),
+            self.view.today.as_deref(),
+            self.run.is_some(),
+            &self.wake,
+        );
+        if let Some(Action::OpenJournal(day)) = action {
+            self.open_journal(&day);
+            self.tab = Tab::Journal;
+        }
+    }
+
     fn journal_ui(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("days")
             .resizable(true)
@@ -473,6 +521,7 @@ impl App {
                     if desktop_config::is_engine_root(&path) {
                         let saved = desktop_config::save_engine_root(&path);
                         self.engine_root = Some(path);
+                        self.dashboard.reset();
                         self.refresh();
                         self.load_form();
                         self.restart_daemon();
@@ -591,6 +640,13 @@ impl App {
             Err(e) => (false, e),
         }
     }
+}
+
+/// As the engine's `_timezone_name`: the settings model defaults to UTC, and a blank or unknown
+/// name falls back to Asia/Jakarta.
+fn engine_timezone(settings: &Layers) -> chrono_tz::Tz {
+    let zone = settings.get_str(&["day", "timezone"]).unwrap_or_else(|| "UTC".into());
+    zone.trim().parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::Asia::Jakarta)
 }
 
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
