@@ -1,9 +1,11 @@
-//! Runs `uv run journal …` in the engine's folder. With `--json` the engine prints one document on
-//! stdout and its human lines on stderr: stderr is streamed to the Run log, stdout is collected
-//! whole and parsed by `engine_json`. The app never interprets the engine's prose.
+//! Runs `uv run journal …` in the engine's folder, or, when the owner turned the Rust runner on,
+//! the engine's own `journal-rs` for a final run or a checkpoint. With `--json` either prints one
+//! document on stdout (the same shape) and its human lines on stderr: stderr is streamed to the
+//! Run log, stdout is collected whole and parsed by `engine_json`. The app never interprets the
+//! engine's prose.
 
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
@@ -46,6 +48,78 @@ impl RunKind {
     }
 }
 
+/// Where the engine's release build of `journal-rs` lives.
+pub fn journal_rs(engine_root: &Path) -> PathBuf {
+    engine_root.join("rust/core/target/release/journal-rs.exe")
+}
+
+/// The program a run starts and its arguments.
+#[derive(Debug)]
+pub struct Invocation {
+    pub program: PathBuf,
+    pub arguments: Vec<String>,
+}
+
+impl Invocation {
+    /// How the Run log names it: `uv run journal run --json`, or `journal-rs run --json`.
+    pub fn describe(&self) -> String {
+        let name = self.program.file_stem().map_or_else(
+            || self.program.display().to_string(),
+            |stem| stem.to_string_lossy().into_owned(),
+        );
+        let mut words = vec![name];
+        words.extend(self.arguments.iter().take_while(|a| *a != "--engine").cloned());
+        words.join(" ")
+    }
+}
+
+/// What starts `kind`, and a note for the Run log when the Rust runner was asked for but the run
+/// goes through `uv` instead. `journal-rs` has no dry run, and it must be built first
+/// (`cargo build --release` in `rust/core`).
+pub fn invocation(engine_root: &Path, kind: RunKind, rust_runner: bool) -> (Invocation, Option<String>) {
+    let python = || Invocation {
+        program: PathBuf::from("uv"),
+        arguments: kind
+            .arguments(speaks_json(engine_root))
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    };
+    if !rust_runner {
+        return (python(), None);
+    }
+    if kind == RunKind::DryRun {
+        return (
+            python(),
+            Some("journal-rs has no dry run; the Python engine ran it".to_owned()),
+        );
+    }
+    let binary = journal_rs(engine_root);
+    if !binary.is_file() {
+        let note = format!(
+            "journal-rs is not built at {}; the Python engine ran it",
+            binary.display()
+        );
+        return (python(), Some(note));
+    }
+    let mut arguments = vec!["run".to_owned()];
+    if kind == RunKind::Checkpoint {
+        arguments.push("--checkpoint".to_owned());
+    }
+    arguments.extend([
+        "--json".to_owned(),
+        "--engine".to_owned(),
+        engine_root.display().to_string(),
+    ]);
+    (
+        Invocation {
+            program: binary,
+            arguments,
+        },
+        None,
+    )
+}
+
 /// What a running engine reports back.
 #[derive(Debug)]
 pub enum RunMessage {
@@ -65,8 +139,8 @@ pub struct QueryResult {
     pub stderr: String,
 }
 
-fn command(engine_root: &Path, arguments: &[&str]) -> Command {
-    let mut command = Command::new("uv");
+fn command<S: AsRef<std::ffi::OsStr>>(program: &Path, engine_root: &Path, arguments: &[S]) -> Command {
+    let mut command = Command::new(program);
     command
         .args(arguments)
         .current_dir(engine_root)
@@ -80,7 +154,7 @@ fn command(engine_root: &Path, arguments: &[&str]) -> Command {
 
 /// Run `uv <arguments>` on a background thread and send its whole output once it ends.
 pub fn query(engine_root: &Path, arguments: &[&str], done: Sender<QueryResult>, wake: impl Fn() + Send + 'static) {
-    let mut command = command(engine_root, arguments);
+    let mut command = command(Path::new("uv"), engine_root, arguments);
     std::thread::spawn(move || {
         let result = match command.output() {
             Ok(output) => QueryResult {
@@ -102,15 +176,17 @@ pub fn query(engine_root: &Path, arguments: &[&str], done: Sender<QueryResult>, 
 /// Start the run on background threads. `wake` is called after every message so the UI repaints.
 pub fn start(
     engine_root: &Path,
-    kind: RunKind,
+    invocation: &Invocation,
     messages: Sender<RunMessage>,
     wake: impl Fn() + Send + Sync + Clone + 'static,
 ) {
-    let arguments = kind.arguments(speaks_json(engine_root));
-    let mut child = match command(engine_root, &arguments).spawn() {
+    let mut child = match command(&invocation.program, engine_root, &invocation.arguments).spawn() {
         Ok(child) => child,
         Err(e) => {
-            let _ = messages.send(RunMessage::Line(format!("Could not start `uv`: {e}")));
+            let _ = messages.send(RunMessage::Line(format!(
+                "Could not start `{}`: {e}",
+                invocation.program.display()
+            )));
             let _ = messages.send(RunMessage::Finished {
                 code: None,
                 stdout: String::new(),
@@ -172,6 +248,56 @@ mod tests {
             RunKind::DryRun.arguments(true).join(" "),
             "run journal run --dry-run --json"
         );
+    }
+
+    fn scratch_engine(test: &str, with_binary: bool) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("ajd-engine-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/activity_journal/cli")).unwrap();
+        std::fs::write(root.join("src/activity_journal/cli/run_document.py"), "").unwrap();
+        if with_binary {
+            let binary = journal_rs(&root);
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(binary, "").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn without_the_rust_runner_every_run_goes_through_uv() {
+        let root = scratch_engine("python", true);
+        let (invocation, note) = invocation(&root, RunKind::Checkpoint, false);
+        assert_eq!(invocation.program, std::path::PathBuf::from("uv"));
+        assert_eq!(invocation.arguments.join(" "), "run journal run --checkpoint --json");
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn the_rust_runner_runs_final_and_checkpoint_through_journal_rs() {
+        let root = scratch_engine("rust", true);
+        let engine = root.display().to_string();
+        let (final_run, note) = invocation(&root, RunKind::Final, true);
+        assert_eq!(final_run.program, journal_rs(&root));
+        assert_eq!(final_run.arguments, ["run", "--json", "--engine", engine.as_str()]);
+        assert_eq!(note, None);
+        let (checkpoint, _) = invocation(&root, RunKind::Checkpoint, true);
+        assert_eq!(
+            checkpoint.arguments,
+            ["run", "--checkpoint", "--json", "--engine", engine.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_dry_run_or_a_missing_binary_falls_back_to_uv_and_says_so() {
+        let root = scratch_engine("dry", true);
+        let (dry, note) = invocation(&root, RunKind::DryRun, true);
+        assert_eq!(dry.program, std::path::PathBuf::from("uv"));
+        assert!(note.unwrap().contains("dry run"));
+
+        let root = scratch_engine("unbuilt", false);
+        let (unbuilt, note) = invocation(&root, RunKind::Final, true);
+        assert_eq!(unbuilt.program, std::path::PathBuf::from("uv"));
+        assert!(note.unwrap().contains("not built"));
     }
 
     #[test]

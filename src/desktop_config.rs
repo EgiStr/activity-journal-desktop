@@ -45,6 +45,16 @@ pub fn set_screenshots(enabled: bool) -> Result<(), String> {
     save_key("screenshots", toml_edit::value(enabled))
 }
 
+/// Whether a final run or a checkpoint goes through the engine's `journal-rs`. Off unless the
+/// owner turned it on.
+pub fn rust_runner_enabled() -> bool {
+    load().get("rust_runner").and_then(|i| i.as_bool()).unwrap_or(false)
+}
+
+pub fn set_rust_runner(enabled: bool) -> Result<(), String> {
+    save_key("rust_runner", toml_edit::value(enabled))
+}
+
 fn load() -> DocumentMut {
     config_path()
         .and_then(|file| std::fs::read_to_string(file).ok())

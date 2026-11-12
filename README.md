@@ -2,9 +2,10 @@
 
 A tray icon, a window and a settings form for the Activity Journal engine (a separate Python
 project, not yet public). It changes nothing about how the engine collects, guards or publishes:
-it reads the files the engine writes and starts `uv run journal …` the way you would by hand,
-reading the engine's `--json` output (`run`, `timeline`, `history`; schema version 1, and a
-version it does not know is refused). It needs an engine with those commands. Windows only, like
+it reads the files the engine writes and starts `uv run journal …` the way you would by hand
+(or, when **Settings** turns the Rust runner on, the engine's own `journal-rs` for a final run or
+a checkpoint), reading the engine's `--json` output (`run`, `timeline`, `history`; schema
+version 1, and a version it does not know is refused). It needs an engine with those commands. Windows only, like
 the engine.
 
 Native Rust GUI: `egui` driven directly on `winit` + `wgpu` (no `eframe`, no webview, no node).
@@ -21,6 +22,7 @@ Native Rust GUI: `egui` driven directly on `winit` + `wgpu` (no `eframe`, no web
 | Journal | The published `journal/YYYY/MM/*.md` files, read-only, final or checkpoint. |
 | Settings | Paths, timezone, model, router URL, router and privacy toggles, and enable/disable for every plugin found under `plugins/*/plugin.json`. Validated before saving. Only changed values are written, into `config/settings.local.toml` and `config/pipeline.local.toml`, keeping your comments. Secrets stay in the environment. |
 | Screenshots | Optional, off by default. The engine's screenshot daemon, ported: every `[screenshot] interval_seconds` it stops below `minimum_free_megabytes`, skips without grabbing when the foreground process or title is excluded, and otherwise writes a PNG of all screens to `<data_dir>/screenshots/<day>/<HHMMSS>.png`, where the engine's purge removes it. Replaces the `ActivityJournal-Daemon` scheduled task; disable that task when you turn this on. |
+| Rust runner | Optional, off by default. The final run and the checkpoint start the engine's `rust/core/target/release/journal-rs.exe run [--checkpoint] --json` instead of `uv run journal run`: one day (yesterday, or today for a checkpoint), each plugin in its own process, the same `--json` document and exit codes. Dry runs stay on the Python engine; an unbuilt binary falls back to it with a line in the Run log. Build it with `cargo build --release` in the engine's `rust/core`. |
 | Autostart | Optional per-user logon entry that starts the app in the tray. The engine's scheduled runs stay in Task Scheduler, so they still happen when the app is closed. |
 
 What it deliberately does not do: change the engine, its output, its lifecycle or its privacy

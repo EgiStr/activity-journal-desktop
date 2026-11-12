@@ -70,6 +70,7 @@ pub struct App {
     show_checkpoint: bool,
     journal_text: String,
     screenshots: bool,
+    rust_runner: bool,
     daemon: Result<Option<Daemon>, String>,
     dashboard: Dashboard,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -99,6 +100,7 @@ impl App {
             show_checkpoint: false,
             journal_text: String::new(),
             screenshots: desktop_config::screenshots_enabled(),
+            rust_runner: desktop_config::rust_runner_enabled(),
             daemon: Ok(None),
             dashboard: Dashboard::default(),
             wake,
@@ -290,13 +292,14 @@ impl App {
             return;
         };
         let (sender, receiver): (Sender<RunMessage>, _) = channel();
-        self.log.push(format!(
-            "— {} started: uv {}",
-            kind.label(),
-            kind.arguments(engine_run::speaks_json(&root)).join(" ")
-        ));
+        let (invocation, note) = engine_run::invocation(&root, kind, self.rust_runner);
+        if let Some(note) = note {
+            self.log.push(format!("— {note}"));
+        }
+        self.log
+            .push(format!("— {} started: {}", kind.label(), invocation.describe()));
         let wake = self.wake.clone();
-        engine_run::start(&root, kind, sender, move || wake());
+        engine_run::start(&root, &invocation, sender, move || wake());
         self.run = Some(RunState {
             kind,
             started: Instant::now(),
@@ -569,6 +572,20 @@ impl App {
             }
             ui.label(
                 "This replaces the ActivityJournal-Daemon scheduled task; disable that task so both do not capture.",
+            );
+            if ui
+                .checkbox(
+                    &mut self.rust_runner,
+                    "Run the final journal and checkpoints with journal-rs (Rust, one day, no backlog catch-up)",
+                )
+                .changed()
+                && let Err(e) = desktop_config::set_rust_runner(self.rust_runner)
+            {
+                self.rust_runner = desktop_config::rust_runner_enabled();
+                self.save_message = Some((false, format!("Rust runner: {e}")));
+            }
+            ui.label(
+                "Needs `cargo build --release` in the engine's rust/core. Dry runs and the scheduled tasks stay on the Python engine.",
             );
             ui.separator();
 

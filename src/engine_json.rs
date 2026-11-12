@@ -259,6 +259,21 @@ mod tests {
         assert_eq!(report.cause, None);
     }
 
+    /// Documents `journal-rs run --json` printed on a scratch engine: the app reads them as it
+    /// reads `journal run --json`.
+    #[test]
+    fn journal_rs_documents_read_like_the_python_ones() {
+        let checkpoint = r#"{"committed_sha":"654cc08c02c2ab4082b2fda97051d6b4264e3262","day":"2026-11-10","degraded":[],"exit_code":0,"exit_reason":"ok","failure":null,"kind":"checkpoint","published":true,"schema_version":1,"skipped_plugins":{},"sources":{"git-commit-collector":"ok"}}"#;
+        let report = parse_run(checkpoint).unwrap();
+        assert_eq!((report.exit_code, report.exit_reason.as_str()), (0, "ok"));
+        assert!(report.degraded.is_empty());
+        assert_eq!(report.cause, None);
+
+        let closed = r#"{"blocked_by_backlog":false,"days":[{"actions":[],"day":"2026-11-10","degraded":[],"exit_code":40,"exit_reason":"day_closed","failure":null,"forced":false,"published":false,"sources":{},"status":"purged"}],"exit_code":40,"exit_reason":"day_closed","failure":null,"kind":"run","lock_held":false,"planned":["2026-11-10"],"plans":[],"schema_version":1,"skipped":["2026-11-10"],"skipped_plugins":{},"untouched":[]}"#;
+        let report = parse_run(closed).unwrap();
+        assert_eq!((report.exit_code, report.exit_reason.as_str()), (40, "day_closed"));
+    }
+
     #[test]
     fn a_blocked_run_takes_its_cause_from_the_run_then_the_day() {
         let day_only = r#"{"schema_version":1,"exit_code":20,"exit_reason":"stuck","failure":null,
