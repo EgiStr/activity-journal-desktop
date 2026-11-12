@@ -576,7 +576,7 @@ impl App {
             if ui
                 .checkbox(
                     &mut self.rust_runner,
-                    "Run the final journal and checkpoints with journal-rs (Rust, one day, no backlog catch-up)",
+                    "Run the final journal and checkpoints with journal-rs (Rust, each plugin in its own process)",
                 )
                 .changed()
                 && let Err(e) = desktop_config::set_rust_runner(self.rust_runner)
