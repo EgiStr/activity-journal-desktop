@@ -12,6 +12,7 @@ mod engine_json;
 mod engine_run;
 mod exit_code;
 mod journal_files;
+mod journal_search;
 mod lifecycle;
 mod notice;
 mod screen_capture;

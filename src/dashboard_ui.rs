@@ -3,6 +3,7 @@
 //! not yet stored it takes the engine's run lock while it collects. A day without stats is shown
 //! as missing, never as zeros, and a degraded source is named.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -15,6 +16,8 @@ use crate::dashboard_data::{
 };
 use crate::engine_json::{DayStats, HistoryDay, Timeline, parse_history, parse_timeline};
 use crate::engine_run::{self, QueryResult};
+use crate::journal_files::DayJournals;
+use crate::journal_search::{self, SearchResult};
 
 const HISTORY_RANGES: [u32; 3] = [7, 14, 30];
 const WARN: Color32 = Color32::from_rgb(222, 160, 30);
@@ -24,6 +27,7 @@ const BAD: Color32 = Color32::from_rgb(215, 58, 73);
 enum Selected {
     Today,
     Week,
+    Search,
     Day(String),
 }
 
@@ -40,6 +44,8 @@ pub struct Dashboard {
     today_pending: Option<Receiver<QueryResult>>,
     history: Option<Result<Vec<HistoryDay>, String>>,
     history_pending: Option<Receiver<QueryResult>>,
+    query: String,
+    search: Option<SearchResult>,
 }
 
 impl Default for Dashboard {
@@ -52,6 +58,8 @@ impl Default for Dashboard {
             today_pending: None,
             history: None,
             history_pending: None,
+            query: String::new(),
+            search: None,
         }
     }
 }
@@ -112,6 +120,7 @@ impl Dashboard {
         root: Option<&Path>,
         today: Option<&str>,
         run_active: bool,
+        journals: &BTreeMap<String, DayJournals>,
         wake: &Arc<dyn Fn() + Send + Sync>,
     ) -> Option<Action> {
         let (Some(root), Some(today)) = (root, today) else {
@@ -136,7 +145,7 @@ impl Dashboard {
             });
         egui::CentralPanel::default_margins().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                action = self.day_ui(ui, root, today, run_active, wake);
+                action = self.day_ui(ui, root, today, run_active, journals, wake);
             });
         });
         action
@@ -163,6 +172,11 @@ impl Dashboard {
         });
         ui.selectable_value(&mut self.selected, Selected::Today, RichText::new("Today").strong());
         ui.selectable_value(&mut self.selected, Selected::Week, RichText::new("This week").strong());
+        ui.selectable_value(
+            &mut self.selected,
+            Selected::Search,
+            RichText::new("Search journals").strong(),
+        );
         if self.history_pending.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -204,12 +218,77 @@ impl Dashboard {
         }
     }
 
+    /// Search the published journals' text, newest day first.
+    fn search_ui(&mut self, ui: &mut egui::Ui, journals: &BTreeMap<String, DayJournals>) -> Option<Action> {
+        let mut action = None;
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("Every word must be on the same line")
+                    .desired_width(320.0),
+            );
+            submit |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            submit |= ui.button("Search").clicked();
+        });
+        if submit {
+            self.search = Some(journal_search::search(journals, &self.query));
+        }
+        let Some(result) = &self.search else {
+            ui.label(format!(
+                "{} day(s) of journals are indexed on disk. Final journals are searched; a day with                  only a checkpoint is searched through its checkpoint.",
+                journals.len()
+            ));
+            return None;
+        };
+        ui.label(format!(
+            "{} match(es) in {} day(s) searched{}",
+            result.hits.len(),
+            result.days_searched,
+            if result.truncated {
+                " (list cut short, narrow the query)"
+            } else {
+                ""
+            }
+        ));
+        if result.unreadable > 0 {
+            ui.colored_label(
+                WARN,
+                format!(
+                    "{} journal file(s) could not be read, so they are not covered.",
+                    result.unreadable
+                ),
+            );
+        }
+        ui.separator();
+        egui::Grid::new("search-hits")
+            .striped(true)
+            .num_columns(3)
+            .show(ui, |ui| {
+                for hit in &result.hits {
+                    let label = if hit.checkpoint {
+                        format!("{} (checkpoint)", hit.day)
+                    } else {
+                        hit.day.clone()
+                    };
+                    if ui.link(label).clicked() {
+                        action = Some(Action::OpenJournal(hit.day.clone()));
+                    }
+                    ui.label(RichText::new(format!("line {}", hit.line)).weak());
+                    ui.label(&hit.text);
+                    ui.end_row();
+                }
+            });
+        action
+    }
+
     fn day_ui(
         &mut self,
         ui: &mut egui::Ui,
         root: &Path,
         today: &str,
         run_active: bool,
+        journals: &BTreeMap<String, DayJournals>,
         wake: &Arc<dyn Fn() + Send + Sync>,
     ) -> Option<Action> {
         match self.selected.clone() {
@@ -272,6 +351,7 @@ impl Dashboard {
                 }
                 None
             }
+            Selected::Search => self.search_ui(ui, journals),
             Selected::Week => {
                 let recap = self
                     .history

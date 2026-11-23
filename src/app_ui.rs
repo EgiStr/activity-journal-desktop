@@ -497,6 +497,7 @@ impl App {
             root.as_deref(),
             self.view.today.as_deref(),
             self.run.is_some(),
+            &self.view.journals,
             &self.wake,
         );
         if let Some(Action::OpenJournal(day)) = action {
