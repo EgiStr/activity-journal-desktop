@@ -10,7 +10,9 @@ use std::sync::mpsc::{Receiver, channel};
 use egui::{Color32, RichText};
 use egui_plot::{Bar, BarChart, Legend, Plot};
 
-use crate::dashboard_data::{Metric, Share, by_project, by_source, cost_total, duration, hourly, reconciles};
+use crate::dashboard_data::{
+    Metric, Share, WeekRecap, by_project, by_source, cost_total, duration, hourly, reconciles, week_recap,
+};
 use crate::engine_json::{DayStats, HistoryDay, Timeline, parse_history, parse_timeline};
 use crate::engine_run::{self, QueryResult};
 
@@ -21,6 +23,7 @@ const BAD: Color32 = Color32::from_rgb(215, 58, 73);
 #[derive(Clone, PartialEq, Eq)]
 enum Selected {
     Today,
+    Week,
     Day(String),
 }
 
@@ -133,7 +136,7 @@ impl Dashboard {
             });
         egui::CentralPanel::default_margins().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                action = self.day_ui(ui, root, run_active, wake);
+                action = self.day_ui(ui, root, today, run_active, wake);
             });
         });
         action
@@ -159,6 +162,7 @@ impl Dashboard {
             }
         });
         ui.selectable_value(&mut self.selected, Selected::Today, RichText::new("Today").strong());
+        ui.selectable_value(&mut self.selected, Selected::Week, RichText::new("This week").strong());
         if self.history_pending.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -204,6 +208,7 @@ impl Dashboard {
         &mut self,
         ui: &mut egui::Ui,
         root: &Path,
+        today: &str,
         run_active: bool,
         wake: &Arc<dyn Fn() + Send + Sync>,
     ) -> Option<Action> {
@@ -267,6 +272,20 @@ impl Dashboard {
                 }
                 None
             }
+            Selected::Week => {
+                let recap = self
+                    .history
+                    .as_ref()
+                    .and_then(|h| h.as_ref().ok())
+                    .and_then(|days| week_recap(days, today));
+                match recap {
+                    Some(recap) => week_ui(&mut self.metric, ui, &recap),
+                    None => {
+                        ui.label("The week is not loaded yet.");
+                        None
+                    }
+                }
+            }
             Selected::Day(day) => {
                 let entry = self
                     .history
@@ -298,6 +317,69 @@ impl Dashboard {
     }
 }
 
+/// The week's recap: a bar per day, then the day panels (breakdowns, apps, cost) over the sum.
+fn week_ui(metric: &mut Metric, ui: &mut egui::Ui, recap: &WeekRecap) -> Option<Action> {
+    ui.heading(format!("Week {} to {}", recap.first_day, recap.last_day));
+    if recap.total.partial {
+        ui.colored_label(WARN, "Partial: a day was rebuilt by force or a source degraded.");
+    }
+    if !recap.missing.is_empty() {
+        let named: Vec<String> = recap
+            .missing
+            .iter()
+            .map(|(day, state)| format!("{day} ({})", missing_label(state).to_lowercase()))
+            .collect();
+        ui.colored_label(
+            WARN,
+            format!("No numbers for {}. Missing data, not days of zeros.", named.join(", ")),
+        );
+    }
+    ui.label(format!(
+        "{} events · {} active over {} day(s)",
+        recap.total.total_events,
+        duration(recap.total.total_active_seconds),
+        recap.per_day.len()
+    ));
+    let bars = recap
+        .per_day
+        .iter()
+        .map(|(day, seconds)| {
+            Bar::new(weekday_index(&recap.first_day, day), *seconds as f64 / 60.0)
+                .width(0.7)
+                .name(day)
+        })
+        .collect();
+    Plot::new(("week", &recap.first_day))
+        .height(180.0)
+        .include_x(-0.5)
+        .include_x(6.5)
+        .include_y(0.0)
+        .allow_drag(false)
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .x_axis_label("Mon … Sun")
+        .y_axis_label("Active minutes")
+        .show(ui, |plot| plot.bar_chart(BarChart::new("Active minutes", bars)));
+    ui.separator();
+    // The week's own line above says what is partial; the day panels' "rebuilt by force" would
+    // be the wrong wording for a sum.
+    let sums = DayStats {
+        partial: false,
+        ..recap.total.clone()
+    };
+    stats_panels(metric, ui, &sums);
+    None
+}
+
+/// 0 for the week's Monday through 6 for its Sunday.
+fn weekday_index(first: &str, day: &str) -> f64 {
+    let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+    match (parse(first), parse(day)) {
+        (Some(a), Some(b)) => (b - a).num_days() as f64,
+        _ => 0.0,
+    }
+}
+
 /// One day's panels, 2c.1 to 2c.4, from its stats document.
 fn stats_ui(metric: &mut Metric, ui: &mut egui::Ui, stats: &DayStats) -> Option<Action> {
     let mut action = None;
@@ -308,7 +390,12 @@ fn stats_ui(metric: &mut Metric, ui: &mut egui::Ui, stats: &DayStats) -> Option<
             action = Some(Action::OpenJournal(stats.day.clone()));
         }
     });
+    stats_panels(metric, ui, stats);
+    action
+}
 
+/// Everything under a day's heading: counts, hourly chart, breakdowns, apps and cost.
+fn stats_panels(metric: &mut Metric, ui: &mut egui::Ui, stats: &DayStats) {
     // 2c.1: counts and sources; a degraded source is named, not shown as zero.
     ui.label(format!(
         "{} events · {} active",
@@ -431,7 +518,6 @@ fn stats_ui(metric: &mut Metric, ui: &mut egui::Ui, stats: &DayStats) -> Option<
                 ui.end_row();
             });
     }
-    action
 }
 
 fn share_table(ui: &mut egui::Ui, title: &str, shares: &[Share]) {

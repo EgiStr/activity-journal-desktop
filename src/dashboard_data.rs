@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::engine_json::DayStats;
+use chrono::Datelike;
+
+use crate::engine_json::{CostRow, DayStats, HistoryDay};
 
 /// What the hourly chart and the breakdowns measure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +94,88 @@ pub fn reconciles(stats: &DayStats) -> bool {
 
 pub fn cost_total(stats: &DayStats) -> f64 {
     stats.cost.iter().map(|c| c.cost_usd).sum()
+}
+
+/// One Monday-to-Sunday week, built from the days `journal history` already returned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeekRecap {
+    pub first_day: String,
+    pub last_day: String,
+    /// Active seconds of each day that has stats, in date order.
+    pub per_day: Vec<(String, u64)>,
+    /// Days with no stats (or not yet in the loaded range) and why. Never counted as zero.
+    pub missing: Vec<(String, String)>,
+    /// Every present day's rows together, so the project, source, app and cost panels reuse the
+    /// day code and add up to the same totals.
+    pub total: DayStats,
+}
+
+/// The week that contains `today`, from `days` (`HistoryDay`s of any range).
+pub fn week_recap(days: &[HistoryDay], today: &str) -> Option<WeekRecap> {
+    let date = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+    let monday = date - chrono::Duration::days(i64::from(date.weekday().num_days_from_monday()));
+    let ids: Vec<String> = (0..7)
+        .map(|n| (monday + chrono::Duration::days(n)).format("%Y-%m-%d").to_string())
+        .collect();
+    let mut recap = WeekRecap {
+        first_day: ids[0].clone(),
+        last_day: ids[6].clone(),
+        per_day: Vec::new(),
+        missing: Vec::new(),
+        total: DayStats {
+            day: format!("{} to {}", ids[0], ids[6]),
+            ..Default::default()
+        },
+    };
+    let mut apps: BTreeMap<String, u64> = BTreeMap::new();
+    let mut domains: BTreeMap<String, u64> = BTreeMap::new();
+    let mut costs: BTreeMap<String, CostRow> = BTreeMap::new();
+    for id in &ids {
+        let Some(entry) = days.iter().find(|d| &d.day == id) else {
+            if id.as_str() <= today {
+                recap.missing.push((id.clone(), "not_loaded".to_owned()));
+            }
+            continue;
+        };
+        let Some(stats) = &entry.stats else {
+            recap.missing.push((id.clone(), entry.state.clone()));
+            continue;
+        };
+        recap.per_day.push((id.clone(), stats.total_active_seconds));
+        let total = &mut recap.total;
+        total.partial |= stats.partial || !stats.degraded().is_empty();
+        total.total_events += stats.total_events;
+        total.total_active_seconds += stats.total_active_seconds;
+        total.hours.extend(stats.hours.iter().cloned());
+        for (name, seconds) in &stats.top_apps {
+            *apps.entry(name.clone()).or_default() += seconds;
+        }
+        for (name, visits) in &stats.top_domains {
+            *domains.entry(name.clone()).or_default() += visits;
+        }
+        for row in &stats.cost {
+            let sum = costs.entry(row.provider.clone()).or_insert_with(|| CostRow {
+                provider: row.provider.clone(),
+                cost_usd: 0.0,
+                requests: 0,
+                total_tokens: 0,
+            });
+            sum.cost_usd += row.cost_usd;
+            sum.requests += row.requests;
+            sum.total_tokens += row.total_tokens;
+        }
+    }
+    recap.total.top_apps = ranked(apps);
+    recap.total.top_domains = ranked(domains);
+    recap.total.cost = costs.into_values().collect();
+    Some(recap)
+}
+
+fn ranked(counts: BTreeMap<String, u64>) -> Vec<(String, u64)> {
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.truncate(10);
+    rows
 }
 
 /// `3725` seconds as `1h 02m`; under an hour as `12m`.
@@ -183,6 +267,60 @@ mod tests {
         let mut s = stats();
         s.total_events = 8;
         assert!(!reconciles(&s));
+    }
+
+    fn history(day: &str, stats: Option<DayStats>) -> HistoryDay {
+        HistoryDay {
+            day: day.into(),
+            state: if stats.is_some() { "ok" } else { "no_journal" }.into(),
+            error: None,
+            stats,
+        }
+    }
+
+    #[test]
+    fn a_week_adds_up_its_days_and_names_the_missing_ones() {
+        let mut tuesday = stats();
+        tuesday.day = "2026-11-10".into();
+        let mut wednesday = stats();
+        wednesday.day = "2026-11-11".into();
+        wednesday.top_apps = vec![("code".into(), 100)];
+        tuesday.top_apps = vec![("code".into(), 50), ("chrome".into(), 70)];
+        let days = [
+            history("2026-11-09", None),
+            history("2026-11-10", Some(tuesday)),
+            history("2026-11-11", Some(wednesday)),
+        ];
+
+        let week = week_recap(&days, "2026-11-12").unwrap();
+
+        assert_eq!(
+            (week.first_day.as_str(), week.last_day.as_str()),
+            ("2026-11-09", "2026-11-15")
+        );
+        assert_eq!(week.per_day.len(), 2);
+        assert_eq!(week.total.total_events, 14);
+        assert_eq!(week.total.total_active_seconds, 6000);
+        assert!(reconciles(&week.total));
+        assert_eq!(week.total.top_apps[0], ("code".to_owned(), 150));
+        assert!((cost_total(&week.total) - 0.6).abs() < 1e-9);
+        assert_eq!(
+            week.missing,
+            [
+                ("2026-11-09".to_owned(), "no_journal".to_owned()),
+                ("2026-11-12".to_owned(), "not_loaded".to_owned()),
+            ],
+            "days after today are not missing, they have not happened"
+        );
+    }
+
+    #[test]
+    fn a_degraded_day_makes_the_week_partial() {
+        let mut day = stats();
+        day.sources = vec![("chrome".into(), "timeout".into())];
+        let week = week_recap(&[history("2026-11-09", Some(day))], "2026-11-09").unwrap();
+        assert!(week.total.partial);
+        assert!(week_recap(&[], "garbage").is_none());
     }
 
     #[test]
