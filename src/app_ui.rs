@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
+use crate::auto_sync;
 use crate::dashboard_ui::{Action, Dashboard};
 use crate::desktop_config;
 use crate::engine_json::parse_run;
@@ -47,6 +48,8 @@ struct EngineView {
 
 struct RunState {
     kind: RunKind,
+    /// Started by the sync timer, not by the owner: it stays out of the way.
+    background: bool,
     started: Instant,
     receiver: Receiver<RunMessage>,
 }
@@ -71,6 +74,9 @@ pub struct App {
     journal_text: String,
     screenshots: bool,
     rust_runner: bool,
+    sync_enabled: bool,
+    sync_minutes: u64,
+    last_sync: Instant,
     daemon: Result<Option<Daemon>, String>,
     dashboard: Dashboard,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -101,6 +107,9 @@ impl App {
             journal_text: String::new(),
             screenshots: desktop_config::screenshots_enabled(),
             rust_runner: desktop_config::rust_runner_enabled(),
+            sync_enabled: desktop_config::sync_enabled(),
+            sync_minutes: desktop_config::sync_interval_minutes(),
+            last_sync: Instant::now(),
             daemon: Ok(None),
             dashboard: Dashboard::default(),
             wake,
@@ -214,6 +223,16 @@ impl App {
 
     /// Called on every loop turn: drain the run's output and refresh on a timer.
     pub fn tick(&mut self) -> Option<Instant> {
+        if auto_sync::is_due(
+            self.sync_enabled,
+            self.last_sync,
+            self.sync_minutes,
+            Instant::now(),
+            self.run.is_some(),
+        ) {
+            self.last_sync = Instant::now();
+            self.begin_run(RunKind::Checkpoint, true);
+        }
         let mut finished = None;
         if let Some(run) = &self.run {
             while let Ok(message) = run.receiver.try_recv() {
@@ -224,12 +243,14 @@ impl App {
                             self.log.drain(..self.log.len() - LOG_LIMIT);
                         }
                     }
-                    RunMessage::Finished { code, stdout } => finished = Some((run.kind, code, stdout)),
+                    RunMessage::Finished { code, stdout } => {
+                        finished = Some((run.kind, run.background, code, stdout));
+                    }
                 }
             }
         }
         self.dashboard.poll();
-        if let Some((kind, code, stdout)) = finished {
+        if let Some((kind, background, code, stdout)) = finished {
             let outcome = code.map(outcome_of);
             self.log.push(match outcome {
                 Some(o) => format!("— exit {} ({}): {}", o.code, o.label, o.advice),
@@ -264,7 +285,12 @@ impl App {
                 Ok(r) => (r.cause, r.degraded),
                 Err(_) => (self.view.days.iter().find_map(|d| d.stuck_cause.clone()), Vec::new()),
             };
-            notice::show(notice::run_finished(kind, outcome, cause.as_deref(), &degraded));
+            // A timer-started sync speaks up only when it needs attention; the owner did not ask
+            // for it, so "ok" and "day already closed" are not worth a notification every time.
+            let needs_attention = outcome.is_none_or(|o| o.severity == Severity::Blocked);
+            if !background || needs_attention {
+                notice::show(notice::run_finished(kind, outcome, cause.as_deref(), &degraded));
+            }
         } else if self.refreshed.elapsed() >= REFRESH_EVERY {
             self.refresh();
         }
@@ -273,7 +299,11 @@ impl App {
         {
             notice::show(notice::screenshots_stopped(&reason));
         }
-        Some(self.refreshed + REFRESH_EVERY)
+        let refresh = self.refreshed + REFRESH_EVERY;
+        Some(
+            auto_sync::next_due(self.sync_enabled, self.last_sync, self.sync_minutes)
+                .map_or(refresh, |due| due.min(refresh)),
+        )
     }
 
     /// Whether something is in flight that animates (a run, or a dashboard query), so the window
@@ -284,11 +314,17 @@ impl App {
 
     /// Start a run unless one is already going. The engine's own lock still decides across processes.
     pub fn start_run(&mut self, kind: RunKind) {
+        self.begin_run(kind, false);
+    }
+
+    fn begin_run(&mut self, kind: RunKind, background: bool) {
         if self.run.is_some() {
             return;
         }
         let Some(root) = self.engine_root.clone() else {
-            self.tab = Tab::Settings;
+            if !background {
+                self.tab = Tab::Settings;
+            }
             return;
         };
         let (sender, receiver): (Sender<RunMessage>, _) = channel();
@@ -296,16 +332,23 @@ impl App {
         if let Some(note) = note {
             self.log.push(format!("— {note}"));
         }
-        self.log
-            .push(format!("— {} started: {}", kind.label(), invocation.describe()));
+        let label = if background {
+            "Auto-sync checkpoint"
+        } else {
+            kind.label()
+        };
+        self.log.push(format!("— {label} started: {}", invocation.describe()));
         let wake = self.wake.clone();
         engine_run::start(&root, &invocation, sender, move || wake());
         self.run = Some(RunState {
             kind,
+            background,
             started: Instant::now(),
             receiver,
         });
-        self.tab = Tab::Run;
+        if !background {
+            self.tab = Tab::Run;
+        }
     }
 
     pub fn tray_state(&self) -> TrayState {
@@ -585,7 +628,37 @@ impl App {
                 self.save_message = Some((false, format!("Rust runner: {e}")));
             }
             ui.label(
-                "Needs `cargo build --release` in the engine's rust/core. Dry runs and the scheduled tasks stay on the Python engine.",
+                "Needs `cargo build --release` in the engine's rust/core; without it the Python engine runs. The scheduled tasks stay on the Python engine.",
+            );
+            ui.separator();
+            ui.label(RichText::new("Sync to GitHub").strong());
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut self.sync_enabled, "Publish a checkpoint every")
+                    .changed()
+                {
+                    self.last_sync = Instant::now();
+                    if let Err(e) = desktop_config::set_sync_enabled(self.sync_enabled) {
+                        self.sync_enabled = desktop_config::sync_enabled();
+                        self.save_message = Some((false, format!("Sync: {e}")));
+                    }
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.sync_minutes)
+                            .range(auto_sync::MIN_MINUTES..=auto_sync::MAX_MINUTES)
+                            .suffix(" min"),
+                    )
+                    .changed()
+                {
+                    self.last_sync = Instant::now();
+                    if let Err(e) = desktop_config::set_sync_interval_minutes(self.sync_minutes) {
+                        self.save_message = Some((false, format!("Sync interval: {e}")));
+                    }
+                }
+            });
+            ui.label(
+                "A checkpoint collects today, writes the narrative and pushes it to the journal repository's remote; the day stays open for the nightly run. It runs only while this app is open, takes the engine's run lock, and each one calls the narrative model, so keep the interval sensible.",
             );
             ui.separator();
 

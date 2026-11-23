@@ -74,8 +74,8 @@ impl Invocation {
 }
 
 /// What starts `kind`, and a note for the Run log when the Rust runner was asked for but the run
-/// goes through `uv` instead. `journal-rs` has no dry run, and it must be built first
-/// (`cargo build --release` in `rust/core`).
+/// goes through `uv` instead because `journal-rs` is not built (`cargo build --release` in
+/// `rust/core`).
 pub fn invocation(engine_root: &Path, kind: RunKind, rust_runner: bool) -> (Invocation, Option<String>) {
     let python = || Invocation {
         program: PathBuf::from("uv"),
@@ -88,12 +88,6 @@ pub fn invocation(engine_root: &Path, kind: RunKind, rust_runner: bool) -> (Invo
     if !rust_runner {
         return (python(), None);
     }
-    if kind == RunKind::DryRun {
-        return (
-            python(),
-            Some("journal-rs has no dry run; the Python engine ran it".to_owned()),
-        );
-    }
     let binary = journal_rs(engine_root);
     if !binary.is_file() {
         let note = format!(
@@ -103,8 +97,12 @@ pub fn invocation(engine_root: &Path, kind: RunKind, rust_runner: bool) -> (Invo
         return (python(), Some(note));
     }
     let mut arguments = vec!["run".to_owned()];
-    if kind == RunKind::Checkpoint {
-        arguments.push("--checkpoint".to_owned());
+    match kind {
+        RunKind::Checkpoint => arguments.push("--checkpoint".to_owned()),
+        // `journal run` catches up by default and `journal-rs` only when asked, so ask: the two
+        // runners then do the same days.
+        RunKind::Final => arguments.push("--catch-up".to_owned()),
+        RunKind::DryRun => arguments.extend(["--dry-run".to_owned(), "--catch-up".to_owned()]),
     }
     arguments.extend([
         "--json".to_owned(),
@@ -278,7 +276,10 @@ mod tests {
         let engine = root.display().to_string();
         let (final_run, note) = invocation(&root, RunKind::Final, true);
         assert_eq!(final_run.program, journal_rs(&root));
-        assert_eq!(final_run.arguments, ["run", "--json", "--engine", engine.as_str()]);
+        assert_eq!(
+            final_run.arguments,
+            ["run", "--catch-up", "--json", "--engine", engine.as_str()]
+        );
         assert_eq!(note, None);
         let (checkpoint, _) = invocation(&root, RunKind::Checkpoint, true);
         assert_eq!(
@@ -288,12 +289,20 @@ mod tests {
     }
 
     #[test]
-    fn a_dry_run_or_a_missing_binary_falls_back_to_uv_and_says_so() {
+    fn the_rust_runner_plans_a_dry_run_over_the_same_days_as_a_final_run() {
         let root = scratch_engine("dry", true);
+        let engine = root.display().to_string();
         let (dry, note) = invocation(&root, RunKind::DryRun, true);
-        assert_eq!(dry.program, std::path::PathBuf::from("uv"));
-        assert!(note.unwrap().contains("dry run"));
+        assert_eq!(dry.program, journal_rs(&root));
+        assert_eq!(
+            dry.arguments,
+            ["run", "--dry-run", "--catch-up", "--json", "--engine", engine.as_str()]
+        );
+        assert_eq!(note, None);
+    }
 
+    #[test]
+    fn a_missing_binary_falls_back_to_uv_and_says_so() {
         let root = scratch_engine("unbuilt", false);
         let (unbuilt, note) = invocation(&root, RunKind::Final, true);
         assert_eq!(unbuilt.program, std::path::PathBuf::from("uv"));

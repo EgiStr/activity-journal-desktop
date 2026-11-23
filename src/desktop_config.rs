@@ -55,6 +55,26 @@ pub fn set_rust_runner(enabled: bool) -> Result<(), String> {
     save_key("rust_runner", toml_edit::value(enabled))
 }
 
+/// Whether the app publishes a checkpoint on a timer. Off unless the owner turned it on, because
+/// each sync pushes to the journal repository's remote.
+pub fn sync_enabled() -> bool {
+    load().get("sync_enabled").and_then(|i| i.as_bool()).unwrap_or(false)
+}
+
+pub fn set_sync_enabled(enabled: bool) -> Result<(), String> {
+    save_key("sync_enabled", toml_edit::value(enabled))
+}
+
+/// Minutes between syncs.
+pub fn sync_interval_minutes() -> u64 {
+    crate::auto_sync::clamp_minutes(load().get("sync_interval_minutes").and_then(|i| i.as_integer()))
+}
+
+pub fn set_sync_interval_minutes(minutes: u64) -> Result<(), String> {
+    let minutes = crate::auto_sync::clamp_minutes(i64::try_from(minutes).ok());
+    save_key("sync_interval_minutes", toml_edit::value(minutes as i64))
+}
+
 fn load() -> DocumentMut {
     config_path()
         .and_then(|file| std::fs::read_to_string(file).ok())

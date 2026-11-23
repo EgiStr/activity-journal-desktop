@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_ui;
+mod auto_sync;
 mod dashboard_data;
 mod dashboard_ui;
 mod desktop_config;
